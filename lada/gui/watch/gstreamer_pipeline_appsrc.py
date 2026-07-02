@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 import logging
+import os
 import threading
 import time
 
 import torch
+import torch.nn.functional as F
 from gi.repository import Gst, GstApp, GObject
 
 from lada import LOG_LEVEL
@@ -16,6 +18,7 @@ from lada.utils.threading_utils import EOF_MARKER, STOP_MARKER, StopMarker, EofM
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=LOG_LEVEL)
+
 
 class FrameRestorerAppSrc(GstApp.AppSrc):
     GST_PLUGIN_NAME = 'framerestorerappsrc'
@@ -52,6 +55,9 @@ class FrameRestorerAppSrc(GstApp.AppSrc):
         self.frame_restorer_provider: FrameRestorerProvider | None = None
         self.frame_restorer_lock: threading.Lock = threading.Lock()
 
+        self.preview_max_height = self._read_preview_max_height_from_env()
+        self.output_width: int | None = None
+        self.output_height: int | None = None
 
         self.appsource_thread: threading.Thread | None = None
         self.appsource_thread_should_be_running: bool = False # Variable controlling state of thread. False if stop or shutdown requested or EOF
@@ -112,11 +118,58 @@ class FrameRestorerAppSrc(GstApp.AppSrc):
     def _set_video_metadata(self, video_metadata: VideoMetadata):
         self.video_metadata = video_metadata
         self.frame_duration_ns = (1 / self.video_metadata.video_fps) * Gst.SECOND
+        self.output_width, self.output_height = self._get_preview_output_size(
+            self.video_metadata.video_width,
+            self.video_metadata.video_height,
+        )
         caps = Gst.Caps.from_string(
-            f"video/x-raw,format=BGR,width={GstPaddingHelpers.get_padded_width(self.video_metadata.video_width)},height={self.video_metadata.video_height},framerate={self.video_metadata.video_fps_exact.numerator}/{self.video_metadata.video_fps_exact.denominator}")
+            f"video/x-raw,format=BGR,width={GstPaddingHelpers.get_padded_width(self.output_width)},height={self.output_height},framerate={self.video_metadata.video_fps_exact.numerator}/{self.video_metadata.video_fps_exact.denominator}")
         self.set_property('caps', caps)
         self.set_property('duration', int((self.video_metadata.frames_count * self.frame_duration_ns)))
-        logger.debug(f"appsource set video metadata: {video_metadata.video_file}")
+        logger.debug(
+            f"appsource set video metadata: {video_metadata.video_file}; "
+            f"preview output: {self.output_width}x{self.output_height}"
+        )
+
+    def _read_preview_max_height_from_env(self) -> int:
+        raw_value = os.environ.get("LADA_PREVIEW_MAX_HEIGHT", "720").strip()
+        try:
+            return max(0, int(raw_value))
+        except ValueError:
+            logger.warning(f"Invalid LADA_PREVIEW_MAX_HEIGHT={raw_value!r}; falling back to 720")
+            return 720
+
+    def _get_preview_output_size(self, source_width: int, source_height: int) -> tuple[int, int]:
+        if self.preview_max_height <= 0 or source_height <= self.preview_max_height:
+            return source_width, source_height
+
+        scale = self.preview_max_height / source_height
+        output_width = max(2, round(source_width * scale))
+        # Keep dimensions even. This avoids surprising failures in downstream video elements on some platforms.
+        if output_width % 2:
+            output_width += 1
+        output_height = max(2, self.preview_max_height)
+        if output_height % 2:
+            output_height += 1
+        return output_width, output_height
+
+    def _resize_frame_for_preview(self, frame: torch.Tensor) -> torch.Tensor:
+        if self.output_width is None or self.output_height is None:
+            return frame
+        if frame.shape[1] == self.output_width and frame.shape[0] == self.output_height:
+            return frame
+
+        # Frame tensors are HWC/BGR/uint8. Resize on the current device before the CPU copy so playback mode
+        # can push fewer bytes through GStreamer even when restoration still runs at source resolution.
+        original_dtype = frame.dtype
+        frame_nchw = frame.permute(2, 0, 1).unsqueeze(0).to(dtype=torch.float32)
+        resized = F.interpolate(
+            frame_nchw,
+            size=(self.output_height, self.output_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return resized.squeeze(0).permute(1, 2, 0).round().clamp_(0, 255).to(dtype=original_dtype)
 
     def _on_need_data(self, src, length):
         logger.debug("appsource need-data")
@@ -187,7 +240,7 @@ class FrameRestorerAppSrc(GstApp.AppSrc):
             start = time.time()
             if shutdown:
                 logger.debug(f"appsource worker: shutdown requested")
-                self.appsource_thread_shutdown_requested =True
+                self.appsource_thread_shutdown_requested = True
             self.appsource_thread_stop_requested = True
             self.appsource_thread_should_be_running = False
 
@@ -241,6 +294,7 @@ class FrameRestorerAppSrc(GstApp.AppSrc):
             frame, frame_pts = result
 
         frame_timestamp_ns = int((frame_pts * self.video_metadata.time_base) * Gst.SECOND)
+        frame = self._resize_frame_for_preview(frame)
         frame = GstPaddingHelpers.pad_frame(frame)
         device_type = frame.device.type
         if device_type in ('cuda', 'xpu', 'mps'):
@@ -279,15 +333,15 @@ class GstPaddingHelpers:
     def pad_frame(frame: torch.Tensor):
         width = frame.shape[1]
         # TODO: see reasoning for this zero padding in TODO where we specify appsrc Caps
-        if width % 4 != 0:
-            pad_w = width % 4
+        pad_w = (4 - width % 4) % 4
+        if pad_w:
             pad_tensor = torch.zeros((frame.shape[0], pad_w, frame.shape[2]), dtype=frame.dtype, device=frame.device)
             return torch.cat((frame, pad_tensor), dim=1)
         return frame
 
     @staticmethod
     def get_padded_width(width):
-        return width + width % 4
+        return width + ((4 - width % 4) % 4)
 
 GObject.type_register(FrameRestorerAppSrc)
 __gstelementfactory__ = (FrameRestorerAppSrc.GST_PLUGIN_NAME,
